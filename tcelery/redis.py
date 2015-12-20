@@ -3,6 +3,7 @@ from datetime import timedelta
 
 from tornado import gen
 from tornadoredis import Client
+from tornadoredis import ConnectionPool
 from tornadoredis.exceptions import ResponseError
 from tornadoredis.pubsub import BaseSubscriber
 
@@ -44,24 +45,39 @@ class RedisClient(Client):
 class RedisConsumer(object):
     def __init__(self, producer):
         self.producer = producer
-        backend = producer.app.backend
-        self.client = RedisClient(host=backend.connparams['host'],
-                                  port=backend.connparams['port'],
-                                  password=backend.connparams['password'],
-                                  selected_db=backend.connparams['db'],
-                                  io_loop=producer.conn_pool.io_loop)
-        self.client.connect()
-        self.subscriber = CelerySubscriber(self.client)
+        self.client = self.create_redis_client()
+        self.subscriber = CelerySubscriber(self.create_redis_client())
 
     def wait_for(self, task_id, callback, expires=None, persistent=None):
-        key = self.producer.app.backend.get_key_for_task(task_id)
+        key = self.backend.get_key_for_task(task_id)
+        current_subscribed = [False]
+
+        def _set_subscribed(subscribed):
+            current_subscribed[0] = subscribed
+
+        def _on_timeout():
+            _set_subscribed(True)
+            self.on_timeout(key)
+
+        # Expiry time of the task should be used rather than the result ? ? ?
         if expires:
-            timeout = self.producer.conn_pool.io_loop.add_timeout(
-                timedelta(microseconds=expires), self.on_timeout, key)
+            timeout = self.io_loop.add_timeout(timedelta(milliseconds=expires), _on_timeout)
         else:
             timeout = None
-        self.subscriber.subscribe(
-            key, partial(self.on_result, key, callback, timeout))
+        current_subscriber = partial(self.on_result, key, callback, timeout)
+        self.io_loop.add_future(gen.Task(self.subscriber.subscribe, key, current_subscriber),
+                                lambda future: _set_subscribed(future.result()))
+
+        # If the task is completed before subscription,
+        # we would not get the result.So we try to check this case
+        # until the subscription is completed.
+        def _check_subscribed(future):
+            result = future.result()
+            if result:
+                current_subscriber(result)
+            elif not current_subscribed[0]:
+                self.io_loop.add_future(gen.Task(self.client.get, key), _check_subscribed)
+        self.io_loop.add_future(gen.Task(self.client.get, key), _check_subscribed)
 
     def on_result(self, key, callback, timeout, result):
         if timeout:
@@ -71,3 +87,26 @@ class RedisConsumer(object):
 
     def on_timeout(self, key):
         self.subscriber.unsubscribe_channel(key)
+
+    def create_redis_client(self):
+        return RedisClient(password=self.backend.connparams['password'],
+                           selected_db=self.backend.connparams['db'],
+                           connection_pool=self.connection_pool,
+                           io_loop=self.io_loop)
+
+    @property
+    def connection_pool(self):
+        if not hasattr(RedisConsumer, '_connection_pool'):
+            self._connection_pool = ConnectionPool(
+                host=self.backend.connparams['host'],
+                port=self.backend.connparams['port'],
+                io_loop=self.io_loop)
+        return self._connection_pool
+
+    @property
+    def io_loop(self):
+        return self.producer.conn_pool.io_loop
+
+    @property
+    def backend(self):
+        return self.producer.app.backend
